@@ -1,3 +1,4 @@
+// src/services/database.ts
 import { supabase } from './supabase';
 import type { Database } from './supabase';
 
@@ -10,26 +11,41 @@ export type Reward = Database['public']['Tables']['rewards']['Row'];
 export type Interaction = Database['public']['Tables']['interactions']['Row'];
 
 export class DatabaseService {
+  // =========================
   // User operations
+  // =========================
   async getCurrentUser(): Promise<User | null> {
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return null;
-
-      const { data, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('auth_user_id', user.id)
-        .single();
-
-      if (error) {
-        console.error('Error fetching user:', error);
+      // Prefer session (stable, avoids edge cases where getUser() can be stale in some flows)
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) {
+        console.error('[getCurrentUser] session error:', sessionError);
         return null;
       }
 
-      return data;
+      const authUserId = sessionData.session?.user?.id;
+      if (!authUserId) return null;
+
+      // CRITICAL FIX:
+      // maybeSingle() prevents PostgREST 406 when 0 rows are returned.
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('auth_user_id', authUserId)
+        .maybeSingle();
+
+      if (error) {
+        // If this fires, common causes:
+        // - auth_user_id duplicates (multiple rows match)
+        // - RLS policy error
+        console.error('[getCurrentUser] query error:', error);
+        return null;
+      }
+
+      // If profile row doesn't exist yet, return null (caller can create profile)
+      return data ?? null;
     } catch (error) {
-      console.error('Error getting current user:', error);
+      console.error('[getCurrentUser] unexpected error:', error);
       return null;
     }
   }
@@ -41,43 +57,41 @@ export class DatabaseService {
     avatar_url?: string;
   }): Promise<User | null> {
     try {
-      const { data, error } = await supabase
-        .from('users')
-        .insert(userData)
-        .select()
-        .single();
+      const { data, error } = await supabase.from('users').insert(userData).select().single();
 
       if (error) {
-        console.error('Error creating user:', error);
+        console.error('[createUser] Error creating user:', error);
         return null;
       }
 
       return data;
     } catch (error) {
-      console.error('Error creating user:', error);
+      console.error('[createUser] unexpected error:', error);
       return null;
     }
   }
 
+  // =========================
   // Community operations
+  // =========================
   async getUserCommunity(userId: string): Promise<Community | null> {
     try {
       const { data, error } = await supabase
         .from('users')
-        .select(`
+        .select(
+          `
           community_id,
           communities (*)
-        `)
+        `
+        )
         .eq('user_id', userId)
-        .single();
+        .maybeSingle();
 
-      if (error || !data?.communities) {
-        return null;
-      }
+      if (error || !data?.communities) return null;
 
-      return data.communities as Community;
+      return data.communities as unknown as Community;
     } catch (error) {
-      console.error('Error fetching user community:', error);
+      console.error('[getUserCommunity] Error fetching user community:', error);
       return null;
     }
   }
@@ -88,48 +102,46 @@ export class DatabaseService {
     admin_id: string;
   }): Promise<Community | null> {
     try {
-      const { data, error } = await supabase
-        .from('communities')
-        .insert(communityData)
-        .select()
-        .single();
+      const { data, error } = await supabase.from('communities').insert(communityData).select().single();
 
       if (error) {
-        console.error('Error creating community:', error);
+        console.error('[createCommunity] Error creating community:', error);
         return null;
       }
 
       return data;
     } catch (error) {
-      console.error('Error creating community:', error);
+      console.error('[createCommunity] unexpected error:', error);
       return null;
     }
   }
 
+  // =========================
   // Milestone operations
-  async getMilestones(userId?: string): Promise<Milestone[]> {
+  // =========================
+  async getMilestones(_userId?: string): Promise<Milestone[]> {
     try {
-      let query = supabase
+      const { data, error } = await supabase
         .from('milestones')
-        .select(`
+        .select(
+          `
           *,
           programs (
             name,
             community_id,
             communities (name)
           )
-        `);
-
-      const { data, error } = await query;
+        `
+        );
 
       if (error) {
-        console.error('Error fetching milestones:', error);
+        console.error('[getMilestones] Error fetching milestones:', error);
         return [];
       }
 
       return data || [];
     } catch (error) {
-      console.error('Error fetching milestones:', error);
+      console.error('[getMilestones] unexpected error:', error);
       return [];
     }
   }
@@ -146,30 +158,29 @@ export class DatabaseService {
     requirements?: string[];
   }): Promise<Milestone | null> {
     try {
-      const { data, error } = await supabase
-        .from('milestones')
-        .insert(milestoneData)
-        .select()
-        .single();
+      const { data, error } = await supabase.from('milestones').insert(milestoneData).select().single();
 
       if (error) {
-        console.error('Error creating milestone:', error);
+        console.error('[createMilestone] Error creating milestone:', error);
         return null;
       }
 
       return data;
     } catch (error) {
-      console.error('Error creating milestone:', error);
+      console.error('[createMilestone] unexpected error:', error);
       return null;
     }
   }
 
+  // =========================
   // Achievement operations
+  // =========================
   async getUserAchievements(userId: string): Promise<Achievement[]> {
     try {
       const { data, error } = await supabase
         .from('achievements')
-        .select(`
+        .select(
+          `
           *,
           milestones (
             title,
@@ -178,18 +189,19 @@ export class DatabaseService {
             reward_token,
             category
           )
-        `)
+        `
+        )
         .eq('user_id', userId)
         .order('created_at', { ascending: false });
 
       if (error) {
-        console.error('Error fetching achievements:', error);
+        console.error('[getUserAchievements] Error fetching achievements:', error);
         return [];
       }
 
       return data || [];
     } catch (error) {
-      console.error('Error fetching achievements:', error);
+      console.error('[getUserAchievements] unexpected error:', error);
       return [];
     }
   }
@@ -203,25 +215,23 @@ export class DatabaseService {
     status?: string;
   }): Promise<Achievement | null> {
     try {
-      const { data, error } = await supabase
-        .from('achievements')
-        .insert(achievementData)
-        .select()
-        .single();
+      const { data, error } = await supabase.from('achievements').insert(achievementData).select().single();
 
       if (error) {
-        console.error('Error creating achievement:', error);
+        console.error('[createAchievement] Error creating achievement:', error);
         return null;
       }
 
       return data;
     } catch (error) {
-      console.error('Error creating achievement:', error);
+      console.error('[createAchievement] unexpected error:', error);
       return null;
     }
   }
 
+  // =========================
   // Reward operations
+  // =========================
   async getUserRewards(userId: string): Promise<Reward[]> {
     try {
       const { data, error } = await supabase
@@ -231,13 +241,13 @@ export class DatabaseService {
         .order('distributed_at', { ascending: false });
 
       if (error) {
-        console.error('Error fetching rewards:', error);
+        console.error('[getUserRewards] Error fetching rewards:', error);
         return [];
       }
 
       return data || [];
     } catch (error) {
-      console.error('Error fetching rewards:', error);
+      console.error('[getUserRewards] unexpected error:', error);
       return [];
     }
   }
@@ -250,25 +260,23 @@ export class DatabaseService {
     status?: string;
   }): Promise<Reward | null> {
     try {
-      const { data, error } = await supabase
-        .from('rewards')
-        .insert(rewardData)
-        .select()
-        .single();
+      const { data, error } = await supabase.from('rewards').insert(rewardData).select().single();
 
       if (error) {
-        console.error('Error creating reward:', error);
+        console.error('[createReward] Error creating reward:', error);
         return null;
       }
 
       return data;
     } catch (error) {
-      console.error('Error creating reward:', error);
+      console.error('[createReward] unexpected error:', error);
       return null;
     }
   }
 
+  // =========================
   // Interaction operations
+  // =========================
   async logInteraction(interactionData: {
     user_id: string;
     message: string;
@@ -277,43 +285,46 @@ export class DatabaseService {
     session_id?: string;
   }): Promise<void> {
     try {
-      const { error } = await supabase
-        .from('interactions')
-        .insert(interactionData);
+      const { error } = await supabase.from('interactions').insert(interactionData);
 
       if (error) {
-        console.error('Error logging interaction:', error);
+        console.error('[logInteraction] Error logging interaction:', error);
       }
     } catch (error) {
-      console.error('Error logging interaction:', error);
+      console.error('[logInteraction] unexpected error:', error);
     }
   }
 
+  // =========================
   // Analytics operations
+  // =========================
   async getCommunityStats(communityId: string) {
     try {
       const [usersResult, programsResult, achievementsResult, rewardsResult] = await Promise.all([
         supabase.from('users').select('user_id', { count: 'exact', head: true }).eq('community_id', communityId),
         supabase.from('programs').select('program_id', { count: 'exact', head: true }).eq('community_id', communityId),
-        supabase.from('achievements').select('achievement_id', { count: 'exact', head: true }).eq('verification_status', 'verified'),
-        supabase.from('rewards').select('token_amount').eq('status', 'confirmed')
+        supabase
+          .from('achievements')
+          .select('achievement_id', { count: 'exact', head: true })
+          .eq('verification_status', 'verified'),
+        supabase.from('rewards').select('token_amount').eq('status', 'confirmed'),
       ]);
 
-      const totalTokens = rewardsResult.data?.reduce((sum, reward) => sum + reward.token_amount, 0) || 0;
+      const totalTokens = rewardsResult.data?.reduce((sum, reward) => sum + (reward.token_amount || 0), 0) || 0;
 
       return {
         totalMembers: usersResult.count || 0,
         activePrograms: programsResult.count || 0,
         completedMilestones: achievementsResult.count || 0,
-        totalRewards: totalTokens
+        totalRewards: totalTokens,
       };
     } catch (error) {
-      console.error('Error fetching community stats:', error);
+      console.error('[getCommunityStats] Error fetching community stats:', error);
       return {
         totalMembers: 0,
         activePrograms: 0,
         completedMilestones: 0,
-        totalRewards: 0
+        totalRewards: 0,
       };
     }
   }
