@@ -1,176 +1,217 @@
-import React, { useState, useEffect } from 'react';
+// PATH: src/pages/Dashboard.tsx
+import React, { useEffect, useMemo, useState, Suspense } from 'react';
 import { motion } from 'framer-motion';
-import { Wallet, ExternalLink, CheckCircle, AlertCircle, Copy } from 'lucide-react';
-import Button from '../UI/Button';
-import Card from '../UI/Card';
-import { blockchainService } from '../../services/blockchain';
+import ImpactMetrics from '../components/Dashboard/ImpactMetrics';
+import DatabaseMilestones from '../components/Dashboard/DatabaseMilestones';
+import DatabaseTokenBalance from '../components/Dashboard/DatabaseTokenBalance';
+import { useAuth } from '../hooks/useAuth';
+import { ensureSampleDataExists } from '../services/sampleData';
 
-interface WalletConnectProps {
-  onWalletConnected?: (address: string) => void;
+/**
+ * Lazy-load heavy panels to improve FCP/LCP.
+ * These components tend to pull large deps (recharts, framer-motion, supabase, blockchain libs).
+ */
+const RealTimeMetrics = React.lazy(() => import('../components/Dashboard/RealtimeMetrics'));
+const AdvancedCharts = React.lazy(() => import('../components/Dashboard/AdvancedCharts'));
+const Leaderboard = React.lazy(() => import('../components/Dashboard/Leaderboard'));
+const WalletConnect = React.lazy(() => import('../components/Blockchain/WalletConnect'));
+
+/**
+ * Defer helper:
+ * - Uses requestIdleCallback when available (best)
+ * - Falls back to setTimeout(0)
+ */
+function defer(fn: () => void, timeout = 1200) {
+  const w: any = window as any;
+
+  if (typeof w.requestIdleCallback === 'function') {
+    const id = w.requestIdleCallback(fn, { timeout });
+    return () => w.cancelIdleCallback?.(id);
+  }
+
+  const t = window.setTimeout(fn, 0);
+  return () => window.clearTimeout(t);
 }
 
-export default function WalletConnect({ onWalletConnected }: WalletConnectProps) {
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  const [tokenBalance, setTokenBalance] = useState<number>(0);
-  const [error, setError] = useState<string | null>(null);
+function PanelSkeleton({ title }: { title: string }) {
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
+      <div className="flex items-center justify-between mb-4">
+        <div className="h-5 w-40 bg-gray-200 rounded animate-pulse" />
+        <div className="h-4 w-20 bg-gray-100 rounded animate-pulse" />
+      </div>
+      <div className="space-y-3">
+        <div className="h-4 w-11/12 bg-gray-100 rounded animate-pulse" />
+        <div className="h-4 w-10/12 bg-gray-100 rounded animate-pulse" />
+        <div className="h-4 w-9/12 bg-gray-100 rounded animate-pulse" />
+      </div>
+      <div className="mt-5 h-36 w-full bg-gray-50 rounded animate-pulse" />
+      <div className="mt-2 text-xs text-gray-400">{title}</div>
+    </div>
+  );
+}
+
+export default function Dashboard() {
+  const { user, loading } = useAuth();
+
+  // Flags to control when heavy panels mount
+  const [showRealtime, setShowRealtime] = useState(false);
+  const [showCharts, setShowCharts] = useState(false);
+  const [showWallet, setShowWallet] = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
 
   useEffect(() => {
-    checkWalletConnection();
+    // Ensure sample data exists for demo purposes (non-blocking)
+    // NOTE: If ensureSampleDataExists triggers network calls, it can slow first render.
+    // We defer it so the initial paint happens sooner.
+    const cancel = defer(() => {
+      ensureSampleDataExists().catch(() => {
+        // do not crash dashboard if demo seeding fails
+      });
+    });
+
+    return cancel;
   }, []);
 
-  const checkWalletConnection = async () => {
-    try {
-      if (blockchainService.isWalletConnected()) {
-        const address = await blockchainService.getCurrentAccount();
-        if (address) {
-          setWalletAddress(address);
-          const balance = await blockchainService.getTokenBalance(address);
-          setTokenBalance(balance);
-        }
-      }
-    } catch (error) {
-      console.error('Failed to check wallet connection:', error);
-    }
-  };
+  useEffect(() => {
+    // Mount heavy panels after initial paint (best-practice for dashboards).
+    // Order matters: realtime first, then wallet/leaderboard, charts last (charts are typically largest).
+    const cancels: Array<() => void> = [];
 
-  const connectWallet = async () => {
-    setIsConnecting(true);
-    setError(null);
+    cancels.push(
+      defer(() => setShowRealtime(true), 800)
+    );
 
-    try {
-      const address = await blockchainService.connectWallet();
-      if (address) {
-        setWalletAddress(address);
-        const balance = await blockchainService.getTokenBalance(address);
-        setTokenBalance(balance);
-        onWalletConnected?.(address);
-      } else {
-        setError('Failed to connect wallet. Please try again.');
-      }
-    } catch (error: any) {
-      setError(error.message || 'Failed to connect wallet');
-    } finally {
-      setIsConnecting(false);
-    }
-  };
+    cancels.push(
+      defer(() => setShowWallet(true), 1200)
+    );
 
-  const copyAddress = () => {
-    if (walletAddress) {
-      navigator.clipboard.writeText(walletAddress);
-    }
-  };
+    cancels.push(
+      defer(() => setShowLeaderboard(true), 1400)
+    );
 
-  const formatAddress = (address: string) => {
-    return `${address.slice(0, 6)}...${address.slice(-4)}`;
-  };
+    cancels.push(
+      defer(() => setShowCharts(true), 1800)
+    );
 
-  if (walletAddress) {
+    return () => {
+      cancels.forEach((c) => c?.());
+    };
+  }, []);
+
+  const firstName = useMemo(() => {
+    const n = user?.name?.trim();
+    if (!n) return 'there';
+    return n.split(/\s+/)[0];
+  }, [user?.name]);
+
+  if (loading) {
     return (
-      <Card>
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-gray-900">Wallet Connected</h3>
-          <div className="flex items-center space-x-2">
-            <CheckCircle className="w-5 h-5 text-green-500" />
-            <span className="text-sm text-green-600 font-medium">Connected</span>
-          </div>
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-8 h-8 border-4 border-primary-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-gray-600">Loading your dashboard...</p>
         </div>
+      </div>
+    );
+  }
 
-        <div className="space-y-4">
-          <div className="bg-gray-50 p-4 rounded-lg">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm text-gray-600">Wallet Address</span>
-              <div className="flex items-center space-x-2">
-                <button
-                  onClick={copyAddress}
-                  className="p-1 hover:bg-gray-200 rounded transition-colors"
-                  title="Copy address"
-                >
-                  <Copy className="w-3 h-3 text-gray-500" />
-                </button>
-                <a
-                  href={`https://etherscan.io/address/${walletAddress}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="p-1 hover:bg-gray-200 rounded transition-colors"
-                  title="View on Etherscan"
-                >
-                  <ExternalLink className="w-3 h-3 text-gray-500" />
-                </a>
-              </div>
-            </div>
-            <p className="font-mono text-sm text-gray-900">
-              {formatAddress(walletAddress)}
-            </p>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="text-center p-3 bg-primary-50 rounded-lg">
-              <p className="text-lg font-bold text-primary-600">{tokenBalance.toLocaleString()}</p>
-              <p className="text-xs text-primary-700">IMPACT Tokens</p>
-            </div>
-            <div className="text-center p-3 bg-green-50 rounded-lg">
-              <p className="text-lg font-bold text-green-600">
-                ${(tokenBalance * 0.45).toFixed(2)}
-              </p>
-              <p className="text-xs text-green-700">USD Value</p>
-            </div>
-          </div>
-
-          <div className="pt-4 border-t border-gray-200">
-            <Button
-              variant="outline"
-              size="sm"
-              className="w-full"
-              onClick={() => window.open(`https://etherscan.io/address/${walletAddress}`, '_blank')}
-            >
-              <ExternalLink className="w-4 h-4 mr-2" />
-              View on Blockchain
-            </Button>
-          </div>
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">Welcome to Community Impact Tracker</h2>
+          <p className="text-gray-600">Please sign in to access your dashboard.</p>
         </div>
-      </Card>
+      </div>
     );
   }
 
   return (
-    <Card>
-      <div className="text-center">
-        <div className="w-16 h-16 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4">
-          <Wallet className="w-8 h-8 text-primary-600" />
-        </div>
-        
-        <h3 className="text-lg font-semibold text-gray-900 mb-2">Connect Your Wallet</h3>
-        <p className="text-gray-600 mb-6">
-          Connect your Web3 wallet to receive IMPACT tokens automatically when you complete milestones.
-        </p>
-
-        {error && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center space-x-2"
-          >
-            <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
-            <span className="text-sm text-red-700">{error}</span>
-          </motion.div>
-        )}
-
-        <Button
-          onClick={connectWallet}
-          loading={isConnecting}
-          className="w-full"
-          size="lg"
+    <div className="min-h-screen bg-gray-50">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Welcome Header */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-8"
         >
-          <Wallet className="w-5 h-5 mr-2" />
-          {isConnecting ? 'Connecting...' : 'Connect MetaMask'}
-        </Button>
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">
+                Welcome back, {firstName}! 👋
+              </h1>
+              <p className="text-gray-600 mt-1">
+                Let&apos;s continue making a positive impact in your community.
+              </p>
+            </div>
+            <div className="hidden sm:flex items-center space-x-4">
+              <div className="text-right">
+                <p className="text-sm text-gray-500">Total Impact Score</p>
+                <p className="text-2xl font-bold text-primary-600">
+                  {Number(user.total_impact_score || 0).toLocaleString()}
+                </p>
+              </div>
+            </div>
+          </div>
+        </motion.div>
 
-        <div className="mt-4 text-xs text-gray-500">
-          <p>Supported wallets: MetaMask, WalletConnect, Coinbase Wallet</p>
-          <p className="mt-1">Your wallet will be used to receive IMPACT token rewards</p>
+        {/* Real-time Metrics (deferred + lazy) */}
+        <div className="mb-8">
+          {showRealtime ? (
+            <Suspense fallback={<PanelSkeleton title="Loading real-time metrics…" />}>
+              <RealTimeMetrics />
+            </Suspense>
+          ) : (
+            <PanelSkeleton title="Real-time metrics queued…" />
+          )}
+        </div>
+
+        {/* Impact Metrics (keep eager; assumed lightweight and “above the fold” value) */}
+        <div className="mb-8">
+          <ImpactMetrics />
+        </div>
+
+        {/* Advanced Charts (deferred + lazy; usually the heaviest bundle) */}
+        <div className="mb-8">
+          {showCharts ? (
+            <Suspense fallback={<PanelSkeleton title="Loading charts…" />}>
+              <AdvancedCharts />
+            </Suspense>
+          ) : (
+            <PanelSkeleton title="Charts queued (idle-load)…" />
+          )}
+        </div>
+
+        {/* Main Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Left Column - Milestones (keep eager; primary dashboard utility) */}
+          <div className="lg:col-span-2 space-y-8">
+            <DatabaseMilestones />
+          </div>
+
+          {/* Right Column - Wallet, Token Balance, Leaderboard (wallet + leaderboard deferred) */}
+          <div className="space-y-8">
+            {showWallet ? (
+              <Suspense fallback={<PanelSkeleton title="Loading wallet module…" />}>
+                <WalletConnect />
+              </Suspense>
+            ) : (
+              <PanelSkeleton title="Wallet module queued…" />
+            )}
+
+            <DatabaseTokenBalance />
+
+            {showLeaderboard ? (
+              <Suspense fallback={<PanelSkeleton title="Loading leaderboard…" />}>
+                <Leaderboard />
+              </Suspense>
+            ) : (
+              <PanelSkeleton title="Leaderboard queued…" />
+            )}
+          </div>
         </div>
       </div>
-    </Card>
+    </div>
   );
 }
