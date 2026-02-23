@@ -1,3 +1,7 @@
+import { initWebVitals } from "./observability/webVitals";
+initWebVitals();
+import { initSentry } from "./observability/sentry";
+initSentry();
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';

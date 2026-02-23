@@ -1,5 +1,5 @@
 // PATH: src/components/Blockchain/WalletConnect.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Wallet, ExternalLink, CheckCircle, AlertCircle, Copy } from 'lucide-react';
 import Button from '../UI/Button';
@@ -10,33 +10,61 @@ interface WalletConnectProps {
   onWalletConnected?: (address: string) => void;
 }
 
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  if (err && typeof err === 'object' && 'message' in err) {
+    const maybeMsg = (err as { message?: unknown }).message;
+    if (typeof maybeMsg === 'string') return maybeMsg;
+  }
+  return 'An unexpected error occurred';
+}
+
 export default function WalletConnect({ onWalletConnected }: WalletConnectProps) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [tokenBalance, setTokenBalance] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void checkWalletConnection();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const explorerBaseUrl = useMemo(() => 'https://etherscan.io/address/', []);
 
-  const checkWalletConnection = async () => {
+  const formatAddress = useCallback(
+    (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`,
+    []
+  );
+
+  const checkWalletConnection = useCallback(async () => {
     try {
-      if (blockchainService.isWalletConnected()) {
-        const address = await blockchainService.getCurrentAccount();
-        if (address) {
-          setWalletAddress(address);
-          const balance = await blockchainService.getTokenBalance(address);
-          setTokenBalance(balance);
-        }
-      }
-    } catch (err) {
+      if (!blockchainService.isWalletConnected()) return;
+
+      const address = await blockchainService.getCurrentAccount();
+      if (!address) return;
+
+      setWalletAddress(address);
+
+      const balance = await blockchainService.getTokenBalance(address);
+      setTokenBalance(balance);
+    } catch (err: unknown) {
       console.error('Failed to check wallet connection:', err);
     }
-  };
+  }, []);
 
-  const connectWallet = async () => {
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      if (cancelled) return;
+      await checkWalletConnection();
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [checkWalletConnection]);
+
+  const connectWallet = useCallback(async () => {
     setIsConnecting(true);
     setError(null);
 
@@ -53,26 +81,25 @@ export default function WalletConnect({ onWalletConnected }: WalletConnectProps)
       setTokenBalance(balance);
 
       onWalletConnected?.(address);
-    } catch (err: any) {
-      setError(err?.message || 'Failed to connect wallet');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err) || 'Failed to connect wallet');
     } finally {
       setIsConnecting(false);
     }
-  };
+  }, [onWalletConnected]);
 
-  const copyAddress = async () => {
+  const copyAddress = useCallback(async () => {
     try {
-      if (walletAddress) {
-        await navigator.clipboard.writeText(walletAddress);
-      }
-    } catch (err) {
+      if (!walletAddress) return;
+      await navigator.clipboard.writeText(walletAddress);
+    } catch (err: unknown) {
       console.error('Failed to copy address:', err);
     }
-  };
-
-  const formatAddress = (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`;
+  }, [walletAddress]);
 
   if (walletAddress) {
+    const explorerUrl = `${explorerBaseUrl}${walletAddress}`;
+
     return (
       <Card>
         <div className="flex items-center justify-between mb-4">
@@ -92,12 +119,13 @@ export default function WalletConnect({ onWalletConnected }: WalletConnectProps)
                   onClick={copyAddress}
                   className="p-1 hover:bg-gray-200 rounded transition-colors"
                   title="Copy address"
+                  type="button"
                 >
                   <Copy className="w-3 h-3 text-gray-500" />
                 </button>
 
                 <a
-                  href={`https://etherscan.io/address/${walletAddress}`}
+                  href={explorerUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="p-1 hover:bg-gray-200 rounded transition-colors"
@@ -127,7 +155,7 @@ export default function WalletConnect({ onWalletConnected }: WalletConnectProps)
               variant="outline"
               size="sm"
               className="w-full"
-              onClick={() => window.open(`https://etherscan.io/address/${walletAddress}`, '_blank')}
+              onClick={() => window.open(explorerUrl, '_blank', 'noopener,noreferrer')}
             >
               <ExternalLink className="w-4 h-4 mr-2" />
               View on Blockchain

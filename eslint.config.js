@@ -19,6 +19,23 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
+
+      // ✔ Allow prefixed unused vars
+      '@typescript-eslint/no-unused-vars': [
+        'warn',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+        },
+      ],
+
+      // ✔ Allow temporary any (warn only)
+      '@typescript-eslint/no-explicit-any': 'warn',
+
+      // ✔ Allow hook deps as warning only
+      'react-hooks/exhaustive-deps': 'warn',
+
       'react-refresh/only-export-components': [
         'warn',
         { allowConstantExport: true },

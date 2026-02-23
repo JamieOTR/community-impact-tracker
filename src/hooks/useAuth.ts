@@ -1,12 +1,59 @@
-// src/hooks/useAuth.ts
-import { useEffect, useState } from 'react';
+// PATH: src/hooks/useAuth.ts
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../services/supabase';
 import { databaseService, type User } from '../services/database';
 
+type AuthResult = { success: true };
+type SignUpResult = { success: true; needsVerification: boolean };
+
+function getErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error) return err.message || fallback;
+  if (typeof err === 'string') return err || fallback;
+  if (err && typeof err === 'object' && 'message' in err) {
+    const msg = (err as { message?: unknown }).message;
+    if (typeof msg === 'string' && msg.trim()) return msg;
+  }
+  return fallback;
+}
+
+function getRedirectBase(): string {
+  const host = window.location.hostname;
+  const isLocal = host === 'localhost' || host === '127.0.0.1';
+  if (isLocal) {
+    return `${window.location.protocol}//${host}:${window.location.port}`;
+  }
+  return window.location.origin;
+}
+
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+
+  const redirectBase = useMemo(() => getRedirectBase(), []);
+
+  const loadUserData = useCallback(async (_authUserId: string) => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      // getCurrentUser() should be auth-scoped via RLS
+      const userData = await databaseService.getCurrentUser();
+
+      if (userData) {
+        setUser(userData);
+      } else {
+        setUser(null);
+        setError('User profile not found');
+      }
+    } catch (err: unknown) {
+      console.error('[useAuth] loadUserData error:', err);
+      setUser(null);
+      setError(getErrorMessage(err, 'Failed to load user data'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -23,8 +70,8 @@ export function useAuth() {
         });
 
         // 1) Get current session
-        const { data, error } = await supabase.auth.getSession();
-        if (error) throw error;
+        const { data, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
 
         const session = data.session;
 
@@ -37,17 +84,17 @@ export function useAuth() {
             setLoading(false);
           });
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error('[useAuth] init error:', err);
         setSafe(() => {
           setUser(null);
-          setError(err?.message || 'Failed to initialize authentication');
+          setError(getErrorMessage(err, 'Failed to initialize authentication'));
           setLoading(false);
         });
       }
     };
 
-    init();
+    void init();
 
     // 3) Listen for auth changes
     const {
@@ -70,11 +117,11 @@ export function useAuth() {
           return;
         }
 
-        // For TOKEN_REFRESHED / USER_UPDATED etc., we keep state stable by default.
-      } catch (err: any) {
+        // TOKEN_REFRESHED / USER_UPDATED etc.: keep state stable by default.
+      } catch (err: unknown) {
         console.error('[useAuth] onAuthStateChange error:', err);
         setSafe(() => {
-          setError(err?.message || 'Auth state change failed');
+          setError(getErrorMessage(err, 'Auth state change failed'));
           setLoading(false);
         });
       }
@@ -84,50 +131,27 @@ export function useAuth() {
       isMounted = false;
       subscription.unsubscribe();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [loadUserData]);
 
-  const loadUserData = async (_authUserId: string) => {
+  const signIn = useCallback(async (email: string, password: string): Promise<AuthResult> => {
     try {
       setLoading(true);
       setError(null);
 
-      // getCurrentUser() should be auth-scoped via RLS
-      const userData = await databaseService.getCurrentUser();
-
-      if (userData) {
-        setUser(userData);
-      } else {
-        setUser(null);
-        setError('User profile not found');
-      }
-    } catch (err: any) {
-      console.error('[useAuth] loadUserData error:', err);
-      setUser(null);
-      setError(err?.message || 'Failed to load user data');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const signIn = async (email: string, password: string) => {
-    try {
-      setLoading(true);
-      setError(null);
-
-      const { data, error } = await supabase.auth.signInWithPassword({
+      const { data, error: signInError } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
 
-      if (error) {
-        if (error.message.includes('Invalid login credentials')) {
+      if (signInError) {
+        const msg = signInError.message || '';
+        if (msg.includes('Invalid login credentials')) {
           throw new Error('Invalid email or password. Please check your credentials and try again.');
         }
-        if (error.message.includes('Email not confirmed')) {
+        if (msg.includes('Email not confirmed')) {
           throw new Error('Please verify your email address before signing in. Check your inbox for a confirmation link.');
         }
-        throw error;
+        throw signInError;
       }
 
       if (data.user?.id) {
@@ -135,15 +159,15 @@ export function useAuth() {
       }
 
       return { success: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to sign in');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to sign in'));
       throw err;
     } finally {
       setLoading(false);
     }
-  };
+  }, [loadUserData]);
 
-  const signUp = async (email: string, password: string, name: string) => {
+  const signUp = useCallback(async (email: string, password: string, name: string): Promise<SignUpResult> => {
     try {
       setLoading(true);
       setError(null);
@@ -152,12 +176,7 @@ export function useAuth() {
       if (!emailRegex.test(email)) throw new Error('Please enter a valid email address');
       if (password.length < 8) throw new Error('Password must be at least 8 characters long');
 
-      const redirectBase =
-        window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-          ? `${window.location.protocol}//${window.location.hostname}:${window.location.port}`
-          : window.location.origin;
-
-      const { data, error } = await supabase.auth.signUp({
+      const { data, error: signUpError } = await supabase.auth.signUp({
         email,
         password,
         options: {
@@ -166,11 +185,12 @@ export function useAuth() {
         },
       });
 
-      if (error) {
-        if (error.message.includes('User already registered')) {
+      if (signUpError) {
+        const msg = signUpError.message || '';
+        if (msg.includes('User already registered')) {
           throw new Error('An account with this email already exists. Please sign in instead.');
         }
-        throw error;
+        throw signUpError;
       }
 
       if (data.session?.user?.id) {
@@ -179,94 +199,92 @@ export function useAuth() {
       }
 
       return { success: true, needsVerification: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to create account');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to create account'));
       throw err;
     } finally {
       setLoading(false);
     }
-  };
+  }, [loadUserData, redirectBase]);
 
-  const resetPassword = async (email: string) => {
+  const resetPassword = useCallback(async (email: string): Promise<AuthResult> => {
     try {
       setLoading(true);
       setError(null);
 
-      const redirectBase =
-        window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-          ? `${window.location.protocol}//${window.location.hostname}:${window.location.port}`
-          : window.location.origin;
-
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
         redirectTo: `${redirectBase}/reset-password`,
       });
 
-      if (error) {
-        if (error.message.includes('User not found')) {
+      if (resetError) {
+        const msg = resetError.message || '';
+        if (msg.includes('User not found')) {
           throw new Error('No account found with this email address');
         }
-        throw error;
+        throw resetError;
       }
 
       return { success: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to send reset email');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to send reset email'));
       throw err;
     } finally {
       setLoading(false);
     }
-  };
+  }, [redirectBase]);
 
-  const updatePassword = async (newPassword: string) => {
+  const updatePassword = useCallback(async (newPassword: string): Promise<AuthResult> => {
     try {
       setLoading(true);
       setError(null);
 
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-      if (error) throw error;
+      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      if (updateError) throw updateError;
 
       return { success: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to update password');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to update password'));
       throw err;
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const signOut = async () => {
+  const signOut = useCallback(async (): Promise<AuthResult> => {
     try {
       setLoading(true);
       setError(null);
 
-      const { error } = await supabase.auth.signOut();
-      if (error) throw error;
+      const { error: signOutError } = await supabase.auth.signOut();
+      if (signOutError) throw signOutError;
 
       setUser(null);
       return { success: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to sign out');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to sign out'));
       throw err;
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const refreshSession = async () => {
+  const refreshSession = useCallback(async (): Promise<AuthResult> => {
     try {
-      const { data, error } = await supabase.auth.refreshSession();
-      if (error) throw error;
+      const { data, error: refreshError } = await supabase.auth.refreshSession();
+      if (refreshError) throw refreshError;
 
       if (data.user?.id) {
         await loadUserData(data.user.id);
       }
 
       return { success: true };
-    } catch (err: any) {
-      setError(err?.message || 'Failed to refresh session');
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Failed to refresh session'));
       throw err;
     }
-  };
+  }, [loadUserData]);
+
+  const clearError = useCallback(() => setError(null), []);
 
   return {
     user,
@@ -278,6 +296,6 @@ export function useAuth() {
     resetPassword,
     updatePassword,
     refreshSession,
-    clearError: () => setError(null),
+    clearError,
   };
 }

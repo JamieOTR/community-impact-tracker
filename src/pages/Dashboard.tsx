@@ -1,6 +1,5 @@
 // PATH: src/pages/Dashboard.tsx
 import React, { Suspense, useEffect, useMemo, useState } from 'react';
-import { motion } from 'framer-motion';
 
 import ImpactMetrics from '../components/Dashboard/ImpactMetrics';
 import DatabaseMilestones from '../components/Dashboard/DatabaseMilestones';
@@ -119,8 +118,8 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Welcome Header */}
-        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mb-8">
+        {/* Welcome Header (CSS-only entrance; keeps motion off critical path) */}
+        <div className="mb-8 opacity-0 translate-y-5 animate-[dashIn_320ms_ease-out_forwards]">
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-2xl font-bold text-gray-900">Welcome back, {firstName}! 👋</h1>
@@ -135,7 +134,15 @@ export default function Dashboard() {
               </div>
             </div>
           </div>
-        </motion.div>
+        </div>
+
+        {/* Inline keyframes (keeps this file self-contained) */}
+        <style>{`
+          @keyframes dashIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to   { opacity: 1; transform: translateY(0); }
+          }
+        `}</style>
 
         {/* Real-time Metrics (deferred + lazy) */}
         <div className="mb-8">
@@ -148,7 +155,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Impact Metrics (keep eager; above-the-fold value) */}
+        {/* Impact Metrics (eager; above-the-fold value) */}
         <div className="mb-8">
           <ImpactMetrics />
         </div>

@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from 'react';
+// PATH: src/components/Admin/AchievementVerification.tsx
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { CheckCircle, XCircle, Eye, Clock, AlertCircle } from 'lucide-react';
+import { formatDistanceToNow } from 'date-fns';
+
 import Card from '../UI/Card';
 import Button from '../UI/Button';
 import { supabase } from '../../services/supabase';
 import { useAuth } from '../../hooks/useAuth';
-import { formatDistanceToNow } from 'date-fns';
 
 interface SubmittedAchievement {
   achievement_id: string;
@@ -18,104 +20,150 @@ interface SubmittedAchievement {
   users: {
     name: string;
     email: string;
+    wallet_address?: string | null;
+    community_id?: string | null;
   };
   milestones: {
     title: string;
     description: string;
     reward_amount: number;
-    reward_token: string;
+    reward_token: string | null;
     category: string;
   };
 }
 
+type RewardStatus = 'pending' | 'paid' | 'confirmed' | 'failed';
+
 export default function AchievementVerification() {
-  const { user } = useAuth();
+  const { user: adminUser } = useAuth();
+
   const [submissions, setSubmissions] = useState<SubmittedAchievement[]>([]);
   const [loading, setLoading] = useState(true);
   const [processingId, setProcessingId] = useState<string | null>(null);
+
   const [selectedSubmission, setSelectedSubmission] = useState<SubmittedAchievement | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
 
-  useEffect(() => {
-    fetchSubmissions();
-  }, []);
+  const pendingCount = useMemo(() => submissions.length, [submissions.length]);
 
-  const fetchSubmissions = async () => {
+  const fetchSubmissions = useCallback(async () => {
     try {
       setLoading(true);
 
+      // Pull wallet/community context if present on users table
       const { data, error } = await supabase
         .from('achievements')
-        .select(`
-          *,
-          users (name, email),
-          milestones (title, description, reward_amount, reward_token, category)
-        `)
+        .select(
+          `
+          achievement_id,
+          user_id,
+          milestone_id,
+          evidence_url,
+          evidence_hash,
+          created_at,
+          updated_at,
+          users (
+            name,
+            email,
+            wallet_address,
+            community_id
+          ),
+          milestones (
+            title,
+            description,
+            reward_amount,
+            reward_token,
+            category
+          )
+        `
+        )
         .eq('status', 'submitted')
         .order('updated_at', { ascending: false });
 
       if (error) throw error;
 
-      setSubmissions(data || []);
-    } catch (error) {
-      console.error('Failed to fetch submissions:', error);
+      setSubmissions((data as SubmittedAchievement[]) ?? []);
+    } catch (_err) {
+      console.error('Failed to fetch submissions');
+      setSubmissions([]);
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    void fetchSubmissions();
+  }, [fetchSubmissions]);
+
+  const openDetailModal = (submission: SubmittedAchievement) => {
+    setSelectedSubmission(submission);
+    setShowDetailModal(true);
   };
 
-  const handleVerify = async (achievementId: string, userId: string, rewardAmount: number) => {
+  const closeDetailModal = () => {
+    setShowDetailModal(false);
+    setSelectedSubmission(null);
+  };
+
+  /**
+   * OPTION A (Clean Accounting):
+   * - Approval = mark achievement verified + create reward row (status: pending)
+   * - Payout job later:
+   *   - sets reward.status -> paid/confirmed
+   *   - sets paid_at/tx_hash/network/wallet_address
+   *   - increments users.token_balance += token_amount
+   */
+  const handleApproveAndQueueReward = async (submission: SubmittedAchievement) => {
+    const achievementId = submission.achievement_id;
+    const recipientUserId = submission.user_id;
+    const rewardAmount = submission.milestones.reward_amount;
+    const tokenType = submission.milestones.reward_token ?? 'IMPACT';
+
+    if (!achievementId || !recipientUserId) return;
+
     try {
       setProcessingId(achievementId);
 
+      const nowIso = new Date().toISOString();
+      const approvedBy = adminUser?.user_id ?? null;
+
+      // 1) Mark achievement verified (approval decision)
       const { error: achievementError } = await supabase
         .from('achievements')
         .update({
           status: 'verified',
           verification_status: 'verified',
-          updated_at: new Date().toISOString()
+          updated_at: nowIso,
         })
         .eq('achievement_id', achievementId);
 
       if (achievementError) throw achievementError;
 
-      const { error: rewardError } = await supabase
-        .from('rewards')
-        .insert({
-          user_id: userId,
-          achievement_id: achievementId,
-          token_amount: rewardAmount,
-          token_type: 'IMPACT',
-          status: 'pending',
-          description: 'Achievement reward pending blockchain distribution'
-        });
+      // 2) Insert reward as pending (not paid yet)
+      //    distributed_at default is now(); treat it as "created_at/queued_at" per your schema note.
+      const rewardPayload = {
+        user_id: recipientUserId,
+        achievement_id: achievementId,
+        token_amount: rewardAmount,
+        token_type: tokenType,
+        status: 'pending' as RewardStatus,
+        description: 'Approved; pending blockchain distribution',
+        approved_by: approvedBy,
+        approved_at: nowIso,
+        wallet_address: submission.users.wallet_address ?? null,
+        community_id: submission.users.community_id ?? null,
+      };
+
+      const { error: rewardError } = await supabase.from('rewards').insert(rewardPayload);
 
       if (rewardError) throw rewardError;
 
-      const { data: userData } = await supabase
-        .from('users')
-        .select('token_balance')
-        .eq('user_id', userId)
-        .single();
-
-      const currentBalance = userData?.token_balance || 0;
-
-      const { error: updateError } = await supabase
-        .from('users')
-        .update({
-          token_balance: currentBalance + rewardAmount,
-          total_impact_score: currentBalance + rewardAmount
-        })
-        .eq('user_id', userId);
-
-      if (updateError) throw updateError;
-
+      // 3) Refresh queue
       await fetchSubmissions();
-      setShowDetailModal(false);
-      setSelectedSubmission(null);
-    } catch (error) {
-      console.error('Failed to verify achievement:', error);
-      alert('Failed to verify achievement. Please try again.');
+      closeDetailModal();
+    } catch (_err) {
+      console.error('Failed to approve submission and queue reward');
+      alert('Failed to approve and queue reward. Please try again.');
     } finally {
       setProcessingId(null);
     }
@@ -129,39 +177,35 @@ export default function AchievementVerification() {
     try {
       setProcessingId(achievementId);
 
+      const nowIso = new Date().toISOString();
+
       const { error } = await supabase
         .from('achievements')
         .update({
           status: 'in-progress',
           verification_status: 'rejected',
           progress: 50,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso,
         })
         .eq('achievement_id', achievementId);
 
       if (error) throw error;
 
       await fetchSubmissions();
-      setShowDetailModal(false);
-      setSelectedSubmission(null);
-    } catch (error) {
-      console.error('Failed to reject achievement:', error);
+      closeDetailModal();
+    } catch (_err) {
+      console.error('Failed to reject achievement');
       alert('Failed to reject achievement. Please try again.');
     } finally {
       setProcessingId(null);
     }
   };
 
-  const openDetailModal = (submission: SubmittedAchievement) => {
-    setSelectedSubmission(submission);
-    setShowDetailModal(true);
-  };
-
   if (loading) {
     return (
       <Card>
         <div className="flex items-center justify-center h-64">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
         </div>
       </Card>
     );
@@ -173,13 +217,11 @@ export default function AchievementVerification() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <h3 className="text-lg font-semibold text-gray-900">Pending Verifications</h3>
-            <p className="text-sm text-gray-600 mt-1">
-              Review and verify submitted achievement evidence
-            </p>
+            <p className="text-sm text-gray-600 mt-1">Review and verify submitted achievement evidence</p>
           </div>
           <div className="flex items-center space-x-2 px-3 py-2 bg-yellow-50 rounded-lg">
             <Clock className="w-5 h-5 text-yellow-600" />
-            <span className="text-sm font-medium text-yellow-700">{submissions.length} Pending</span>
+            <span className="text-sm font-medium text-yellow-700">{pendingCount} Pending</span>
           </div>
         </div>
 
@@ -201,9 +243,7 @@ export default function AchievementVerification() {
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
                     <div className="flex items-center space-x-3 mb-2">
-                      <h4 className="font-semibold text-gray-900">
-                        {submission.milestones.title}
-                      </h4>
+                      <h4 className="font-semibold text-gray-900">{submission.milestones.title}</h4>
                       <span className="px-2 py-1 text-xs font-medium bg-yellow-50 text-yellow-700 rounded-full">
                         Pending Review
                       </span>
@@ -226,11 +266,13 @@ export default function AchievementVerification() {
                     <div className="flex items-center justify-between text-sm">
                       <div className="flex items-center space-x-4">
                         <span className="text-gray-600">
-                          Category: <span className="font-medium text-gray-900">{submission.milestones.category}</span>
+                          Category:{' '}
+                          <span className="font-medium text-gray-900">{submission.milestones.category}</span>
                         </span>
                         <span className="text-gray-600">
-                          Reward: <span className="font-medium text-secondary-600">
-                            {submission.milestones.reward_amount} {submission.milestones.reward_token || 'IMPACT'}
+                          Reward:{' '}
+                          <span className="font-medium text-secondary-600">
+                            {submission.milestones.reward_amount} {submission.milestones.reward_token ?? 'IMPACT'}
                           </span>
                         </span>
                       </div>
@@ -279,7 +321,7 @@ export default function AchievementVerification() {
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Reward Amount</p>
                   <p className="text-lg font-semibold text-secondary-600">
-                    {selectedSubmission.milestones.reward_amount} {selectedSubmission.milestones.reward_token || 'IMPACT'}
+                    {selectedSubmission.milestones.reward_amount} {selectedSubmission.milestones.reward_token ?? 'IMPACT'}
                   </p>
                 </div>
               </div>
@@ -312,26 +354,18 @@ export default function AchievementVerification() {
                   <ul className="list-disc list-inside space-y-1 text-xs">
                     <li>Review the submitted evidence carefully</li>
                     <li>Verify it meets the milestone requirements</li>
-                    <li>Approving will distribute rewards to the participant</li>
-                    <li>Rejecting will return the milestone to in-progress status</li>
+                    <li>Approving queues rewards for payout</li>
+                    <li>Rejecting returns the milestone to in-progress status</li>
                   </ul>
                 </div>
               </div>
             </div>
 
             <div className="flex space-x-3">
-              <Button
-                variant="outline"
-                size="sm"
-                className="flex-1"
-                onClick={() => {
-                  setShowDetailModal(false);
-                  setSelectedSubmission(null);
-                }}
-                disabled={!!processingId}
-              >
+              <Button variant="outline" size="sm" className="flex-1" onClick={closeDetailModal} disabled={!!processingId}>
                 Cancel
               </Button>
+
               <Button
                 size="sm"
                 className="flex-1 bg-red-600 hover:bg-red-700 text-white"
@@ -341,18 +375,15 @@ export default function AchievementVerification() {
                 <XCircle className="w-4 h-4 mr-1" />
                 {processingId === selectedSubmission.achievement_id ? 'Processing...' : 'Reject'}
               </Button>
+
               <Button
                 size="sm"
                 className="flex-1 bg-green-600 hover:bg-green-700 text-white"
-                onClick={() => handleVerify(
-                  selectedSubmission.achievement_id,
-                  selectedSubmission.user_id,
-                  selectedSubmission.milestones.reward_amount
-                )}
+                onClick={() => void handleApproveAndQueueReward(selectedSubmission)}
                 disabled={!!processingId}
               >
                 <CheckCircle className="w-4 h-4 mr-1" />
-                {processingId === selectedSubmission.achievement_id ? 'Processing...' : 'Approve & Reward'}
+                {processingId === selectedSubmission.achievement_id ? 'Processing...' : 'Approve & Queue Reward'}
               </Button>
             </div>
           </motion.div>
