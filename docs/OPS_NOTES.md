@@ -1,0 +1,1 @@
+- Governance lock: branch protection enabled (main)
