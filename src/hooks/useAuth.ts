@@ -1,10 +1,12 @@
 // PATH: src/hooks/useAuth.ts
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '../services/supabase';
 import { databaseService, type User } from '../services/database';
 
 type AuthResult = { success: true };
 type SignUpResult = { success: true; needsVerification: boolean };
+
+const AUTH_TIMEOUT_MS = 20000;
 
 function getErrorMessage(err: unknown, fallback: string): string {
   if (err instanceof Error) return err.message || fallback;
@@ -25,6 +27,24 @@ function getRedirectBase(): string {
   return window.location.origin;
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+
+    promise
+      .then((value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        window.clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -32,259 +52,463 @@ export function useAuth() {
 
   const redirectBase = useMemo(() => getRedirectBase(), []);
 
-  const loadUserData = useCallback(async (_authUserId: string) => {
-    try {
-      setLoading(true);
-      setError(null);
+  const mountedRef = useRef(true);
+  const bootstrapInFlightRef = useRef(false);
+  const profilePromiseRef = useRef<Promise<User | null> | null>(null);
+  const lastResolvedAuthUserIdRef = useRef<string | null>(null);
+  const lastCreateAttemptAuthUserIdRef = useRef<string | null>(null);
 
-      // getCurrentUser() should be auth-scoped via RLS
-      const userData = await databaseService.getCurrentUser();
+  const safeSetUser = useCallback((nextUser: User | null) => {
+    if (!mountedRef.current) return;
+    setUser((prev) => {
+      const prevId = prev?.user_id ?? null;
+      const nextId = nextUser?.user_id ?? null;
+      if (prevId === nextId) return prev;
+      return nextUser;
+    });
+  }, []);
 
-      if (userData) {
-        setUser(userData);
-      } else {
-        setUser(null);
-        setError('User profile not found');
+  const safeSetLoading = useCallback((value: boolean) => {
+    if (!mountedRef.current) return;
+    setLoading((prev) => (prev === value ? prev : value));
+  }, []);
+
+  const safeSetError = useCallback((value: string | null) => {
+    if (!mountedRef.current) return;
+    setError((prev) => (prev === value ? prev : value));
+  }, []);
+
+  const ensureUserProfileFromSession = useCallback(async (): Promise<User | null> => {
+    if (profilePromiseRef.current) {
+      return profilePromiseRef.current;
+    }
+
+    profilePromiseRef.current = (async () => {
+      console.log('[useAuth] ensureUserProfileFromSession: start');
+
+      const { data, error: sessionError } = await withTimeout(
+        supabase.auth.getSession(),
+        AUTH_TIMEOUT_MS,
+        'supabase.auth.getSession'
+      );
+
+      if (sessionError) throw sessionError;
+
+      const authUser = data.session?.user;
+      console.log(
+        '[useAuth] ensureUserProfileFromSession: auth user',
+        authUser?.email,
+        authUser?.id
+      );
+
+      if (!authUser?.id) {
+        lastResolvedAuthUserIdRef.current = null;
+        return null;
       }
-    } catch (err: unknown) {
-      console.error('[useAuth] loadUserData error:', err);
-      setUser(null);
-      setError(getErrorMessage(err, 'Failed to load user data'));
+
+      let currentUser = await withTimeout(
+        databaseService.getCurrentUser(),
+        AUTH_TIMEOUT_MS,
+        'databaseService.getCurrentUser'
+      );
+
+      console.log(
+        '[useAuth] ensureUserProfileFromSession: current user exists?',
+        !!currentUser
+      );
+
+      if (!currentUser) {
+        const sameCreateAttempt = lastCreateAttemptAuthUserIdRef.current === authUser.id;
+
+        if (!sameCreateAttempt) {
+          console.log('[useAuth] ensureUserProfileFromSession: creating missing profile');
+          lastCreateAttemptAuthUserIdRef.current = authUser.id;
+
+          const createdUser = await withTimeout(
+            databaseService.createUser({
+              email: authUser.email ?? '',
+              name:
+                (authUser.user_metadata?.full_name as string | undefined)?.trim() ||
+                authUser.email?.split('@')[0] ||
+                'User',
+              auth_user_id: authUser.id,
+              avatar_url:
+                typeof authUser.user_metadata?.avatar_url === 'string'
+                  ? authUser.user_metadata.avatar_url
+                  : undefined,
+            }),
+            AUTH_TIMEOUT_MS,
+            'databaseService.createUser'
+          );
+
+          if (!createdUser) {
+            throw new Error('Failed to create user profile');
+          }
+        } else {
+          console.log(
+            '[useAuth] ensureUserProfileFromSession: skipping duplicate create attempt'
+          );
+        }
+
+        currentUser = await withTimeout(
+          databaseService.getCurrentUser(),
+          AUTH_TIMEOUT_MS,
+          'databaseService.getCurrentUser after create'
+        );
+      }
+
+      lastResolvedAuthUserIdRef.current = authUser.id;
+      console.log('[useAuth] ensureUserProfileFromSession: done', currentUser?.email);
+      return currentUser;
+    })();
+
+    try {
+      return await profilePromiseRef.current;
     } finally {
-      setLoading(false);
+      profilePromiseRef.current = null;
     }
   }, []);
 
-  useEffect(() => {
-    let isMounted = true;
+  const bootstrapAuth = useCallback(async () => {
+    if (bootstrapInFlightRef.current) {
+      console.log('[useAuth] bootstrapAuth: skipped, already in flight');
+      return;
+    }
 
-    const setSafe = (fn: () => void) => {
-      if (isMounted) fn();
-    };
+    bootstrapInFlightRef.current = true;
+    console.log('[useAuth] bootstrapAuth: start');
+    safeSetLoading(true);
+    safeSetError(null);
 
-    const init = async () => {
-      try {
-        setSafe(() => {
-          setLoading(true);
-          setError(null);
-        });
+    try {
+      const { data, error: sessionError } = await withTimeout(
+        supabase.auth.getSession(),
+        AUTH_TIMEOUT_MS,
+        'bootstrap getSession'
+      );
 
-        // 1) Get current session
-        const { data, error: sessionError } = await supabase.auth.getSession();
-        if (sessionError) throw sessionError;
+      if (sessionError) throw sessionError;
 
-        const session = data.session;
+      const session = data.session;
+      console.log('[useAuth] bootstrapAuth: session user', session?.user?.email);
 
-        // 2) If signed in, load profile. If not signed in, stop cleanly.
-        if (session?.user?.id) {
-          await loadUserData(session.user.id);
-        } else {
-          setSafe(() => {
-            setUser(null);
-            setLoading(false);
-          });
-        }
-      } catch (err: unknown) {
-        console.error('[useAuth] init error:', err);
-        setSafe(() => {
-          setUser(null);
-          setError(getErrorMessage(err, 'Failed to initialize authentication'));
-          setLoading(false);
-        });
+      if (!session?.user?.id) {
+        lastResolvedAuthUserIdRef.current = null;
+        safeSetUser(null);
+        safeSetLoading(false);
+        console.log('[useAuth] bootstrapAuth: no session');
+        return;
       }
-    };
 
-    void init();
+      const resolvedUser = await ensureUserProfileFromSession();
+      safeSetUser(resolvedUser);
+      safeSetLoading(false);
+      console.log('[useAuth] bootstrapAuth: resolved user', resolvedUser?.email);
+    } catch (err: unknown) {
+      console.error('[useAuth] bootstrapAuth error:', err);
 
-    // 3) Listen for auth changes
+      const message = getErrorMessage(err, 'Failed to initialize authentication');
+      safeSetError(message);
+
+      try {
+        const { data } = await withTimeout(
+          supabase.auth.getSession(),
+          AUTH_TIMEOUT_MS,
+          'bootstrap recovery getSession'
+        );
+
+        if (data.session?.user?.id) {
+          const recoveredUser = await ensureUserProfileFromSession();
+          safeSetUser(recoveredUser);
+        } else {
+          safeSetUser(null);
+        }
+      } catch (recoveryErr) {
+        console.error('[useAuth] bootstrapAuth recovery failed:', recoveryErr);
+        safeSetUser(null);
+      } finally {
+        safeSetLoading(false);
+      }
+    } finally {
+      bootstrapInFlightRef.current = false;
+    }
+  }, [ensureUserProfileFromSession, safeSetError, safeSetLoading, safeSetUser]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    void bootstrapAuth();
+
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
+      console.log('[useAuth] onAuthStateChange:', event, session?.user?.email);
+
+      if (!mountedRef.current) return;
+
       try {
-        if (!isMounted) return;
-
-        if (event === 'SIGNED_IN' && session?.user?.id) {
-          await loadUserData(session.user.id);
-          return;
-        }
-
         if (event === 'SIGNED_OUT') {
-          setSafe(() => {
-            setUser(null);
-            setError(null);
-            setLoading(false);
-          });
+          lastResolvedAuthUserIdRef.current = null;
+          lastCreateAttemptAuthUserIdRef.current = null;
+          safeSetUser(null);
+          safeSetError(null);
+          safeSetLoading(false);
           return;
         }
 
-        // TOKEN_REFRESHED / USER_UPDATED etc.: keep state stable by default.
+        if (!session?.user?.id) {
+          lastResolvedAuthUserIdRef.current = null;
+          safeSetUser(null);
+          safeSetLoading(false);
+          return;
+        }
+
+        if (
+          event === 'INITIAL_SESSION' &&
+          lastResolvedAuthUserIdRef.current === session.user.id &&
+          user
+        ) {
+          console.log('[useAuth] onAuthStateChange: skipping duplicate INITIAL_SESSION');
+          safeSetLoading(false);
+          return;
+        }
+
+        safeSetLoading(true);
+        const resolvedUser = await ensureUserProfileFromSession();
+        safeSetUser(resolvedUser);
+        safeSetLoading(false);
       } catch (err: unknown) {
         console.error('[useAuth] onAuthStateChange error:', err);
-        setSafe(() => {
-          setError(getErrorMessage(err, 'Auth state change failed'));
-          setLoading(false);
-        });
+        safeSetError(getErrorMessage(err, 'Auth state change failed'));
+        safeSetLoading(false);
       }
     });
 
     return () => {
-      isMounted = false;
+      mountedRef.current = false;
       subscription.unsubscribe();
     };
-  }, [loadUserData]);
+  }, [bootstrapAuth, ensureUserProfileFromSession, safeSetError, safeSetLoading, safeSetUser, user]);
 
-  const signIn = useCallback(async (email: string, password: string): Promise<AuthResult> => {
-    try {
-      setLoading(true);
-      setError(null);
+  const signIn = useCallback(
+    async (email: string, password: string): Promise<AuthResult> => {
+      try {
+        safeSetLoading(true);
+        safeSetError(null);
 
-      const { data, error: signInError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
+        const { data, error: signInError } = await withTimeout(
+          supabase.auth.signInWithPassword({ email, password }),
+          AUTH_TIMEOUT_MS,
+          'signInWithPassword'
+        );
 
-      if (signInError) {
-        const msg = signInError.message || '';
-        if (msg.includes('Invalid login credentials')) {
-          throw new Error('Invalid email or password. Please check your credentials and try again.');
+        if (signInError) {
+          const msg = signInError.message || '';
+          if (msg.includes('Invalid login credentials')) {
+            throw new Error(
+              'Invalid email or password. Please check your credentials and try again.'
+            );
+          }
+          if (msg.includes('Email not confirmed')) {
+            throw new Error(
+              'Please verify your email address before signing in. Check your inbox for a confirmation link.'
+            );
+          }
+          throw signInError;
         }
-        if (msg.includes('Email not confirmed')) {
-          throw new Error('Please verify your email address before signing in. Check your inbox for a confirmation link.');
+
+        console.log('[useAuth] signIn success:', data.user?.email);
+
+        if (data.user?.id) {
+          const resolvedUser = await ensureUserProfileFromSession();
+          safeSetUser(resolvedUser);
+        } else {
+          safeSetUser(null);
         }
-        throw signInError;
+
+        safeSetLoading(false);
+        return { success: true };
+      } catch (err: unknown) {
+        console.error('[useAuth] signIn error:', err);
+        safeSetUser(null);
+        safeSetError(getErrorMessage(err, 'Failed to sign in'));
+        safeSetLoading(false);
+        throw err;
       }
+    },
+    [ensureUserProfileFromSession, safeSetError, safeSetLoading, safeSetUser]
+  );
 
-      if (data.user?.id) {
-        await loadUserData(data.user.id);
-      }
+  const signUp = useCallback(
+    async (email: string, password: string, name: string): Promise<SignUpResult> => {
+      try {
+        safeSetLoading(true);
+        safeSetError(null);
 
-      return { success: true };
-    } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to sign in'));
-      throw err;
-    } finally {
-      setLoading(false);
-    }
-  }, [loadUserData]);
-
-  const signUp = useCallback(async (email: string, password: string, name: string): Promise<SignUpResult> => {
-    try {
-      setLoading(true);
-      setError(null);
-
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) throw new Error('Please enter a valid email address');
-      if (password.length < 8) throw new Error('Password must be at least 8 characters long');
-
-      const { data, error: signUpError } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: { full_name: name },
-          emailRedirectTo: `${redirectBase}/dashboard`,
-        },
-      });
-
-      if (signUpError) {
-        const msg = signUpError.message || '';
-        if (msg.includes('User already registered')) {
-          throw new Error('An account with this email already exists. Please sign in instead.');
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          throw new Error('Please enter a valid email address');
         }
-        throw signUpError;
-      }
-
-      if (data.session?.user?.id) {
-        await loadUserData(data.session.user.id);
-        return { success: true, needsVerification: false };
-      }
-
-      return { success: true, needsVerification: true };
-    } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to create account'));
-      throw err;
-    } finally {
-      setLoading(false);
-    }
-  }, [loadUserData, redirectBase]);
-
-  const resetPassword = useCallback(async (email: string): Promise<AuthResult> => {
-    try {
-      setLoading(true);
-      setError(null);
-
-      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${redirectBase}/reset-password`,
-      });
-
-      if (resetError) {
-        const msg = resetError.message || '';
-        if (msg.includes('User not found')) {
-          throw new Error('No account found with this email address');
+        if (password.length < 8) {
+          throw new Error('Password must be at least 8 characters long');
         }
-        throw resetError;
-      }
 
-      return { success: true };
-    } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to send reset email'));
-      throw err;
-    } finally {
-      setLoading(false);
-    }
-  }, [redirectBase]);
+        const { data, error: signUpError } = await withTimeout(
+          supabase.auth.signUp({
+            email,
+            password,
+            options: {
+              data: { full_name: name },
+              emailRedirectTo: `${redirectBase}/dashboard`,
+            },
+          }),
+          AUTH_TIMEOUT_MS,
+          'signUp'
+        );
+
+        if (signUpError) {
+          const msg = signUpError.message || '';
+          if (msg.includes('User already registered')) {
+            throw new Error(
+              'An account with this email already exists. Please sign in instead.'
+            );
+          }
+          throw signUpError;
+        }
+
+        if (data.session?.user?.id) {
+          const resolvedUser = await ensureUserProfileFromSession();
+          safeSetUser(resolvedUser);
+          safeSetLoading(false);
+          return { success: true, needsVerification: false };
+        }
+
+        safeSetLoading(false);
+        return { success: true, needsVerification: true };
+      } catch (err: unknown) {
+        console.error('[useAuth] signUp error:', err);
+        safeSetError(getErrorMessage(err, 'Failed to create account'));
+        safeSetLoading(false);
+        throw err;
+      }
+    },
+    [ensureUserProfileFromSession, redirectBase, safeSetError, safeSetLoading, safeSetUser]
+  );
+
+  const resetPassword = useCallback(
+    async (email: string): Promise<AuthResult> => {
+      try {
+        safeSetLoading(true);
+        safeSetError(null);
+
+        const { error: resetError } = await withTimeout(
+          supabase.auth.resetPasswordForEmail(email, {
+            redirectTo: `${redirectBase}/reset-password`,
+          }),
+          AUTH_TIMEOUT_MS,
+          'resetPasswordForEmail'
+        );
+
+        if (resetError) {
+          const msg = resetError.message || '';
+          if (msg.includes('User not found')) {
+            throw new Error('No account found with this email address');
+          }
+          throw resetError;
+        }
+
+        safeSetLoading(false);
+        return { success: true };
+      } catch (err: unknown) {
+        console.error('[useAuth] resetPassword error:', err);
+        safeSetError(getErrorMessage(err, 'Failed to send reset email'));
+        safeSetLoading(false);
+        throw err;
+      }
+    },
+    [redirectBase, safeSetError, safeSetLoading]
+  );
 
   const updatePassword = useCallback(async (newPassword: string): Promise<AuthResult> => {
     try {
-      setLoading(true);
-      setError(null);
+      safeSetLoading(true);
+      safeSetError(null);
 
-      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      const { error: updateError } = await withTimeout(
+        supabase.auth.updateUser({ password: newPassword }),
+        AUTH_TIMEOUT_MS,
+        'updateUser'
+      );
+
       if (updateError) throw updateError;
 
+      safeSetLoading(false);
       return { success: true };
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to update password'));
+      console.error('[useAuth] updatePassword error:', err);
+      safeSetError(getErrorMessage(err, 'Failed to update password'));
+      safeSetLoading(false);
       throw err;
-    } finally {
-      setLoading(false);
     }
-  }, []);
+  }, [safeSetError, safeSetLoading]);
 
   const signOut = useCallback(async (): Promise<AuthResult> => {
     try {
-      setLoading(true);
-      setError(null);
+      safeSetLoading(true);
+      safeSetError(null);
 
-      const { error: signOutError } = await supabase.auth.signOut();
+      const { error: signOutError } = await withTimeout(
+        supabase.auth.signOut(),
+        AUTH_TIMEOUT_MS,
+        'signOut'
+      );
+
       if (signOutError) throw signOutError;
 
-      setUser(null);
+      lastResolvedAuthUserIdRef.current = null;
+      lastCreateAttemptAuthUserIdRef.current = null;
+      safeSetUser(null);
+      safeSetLoading(false);
       return { success: true };
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to sign out'));
+      console.error('[useAuth] signOut error:', err);
+      safeSetError(getErrorMessage(err, 'Failed to sign out'));
+      safeSetLoading(false);
       throw err;
-    } finally {
-      setLoading(false);
     }
-  }, []);
+  }, [safeSetError, safeSetLoading, safeSetUser]);
 
   const refreshSession = useCallback(async (): Promise<AuthResult> => {
     try {
-      const { data, error: refreshError } = await supabase.auth.refreshSession();
+      safeSetLoading(true);
+      safeSetError(null);
+
+      const { data, error: refreshError } = await withTimeout(
+        supabase.auth.refreshSession(),
+        AUTH_TIMEOUT_MS,
+        'refreshSession'
+      );
+
       if (refreshError) throw refreshError;
 
       if (data.user?.id) {
-        await loadUserData(data.user.id);
+        const resolvedUser = await ensureUserProfileFromSession();
+        safeSetUser(resolvedUser);
+      } else {
+        safeSetUser(null);
       }
 
+      safeSetLoading(false);
       return { success: true };
     } catch (err: unknown) {
-      setError(getErrorMessage(err, 'Failed to refresh session'));
+      console.error('[useAuth] refreshSession error:', err);
+      safeSetError(getErrorMessage(err, 'Failed to refresh session'));
+      safeSetLoading(false);
       throw err;
     }
-  }, [loadUserData]);
+  }, [ensureUserProfileFromSession, safeSetError, safeSetLoading, safeSetUser]);
 
-  const clearError = useCallback(() => setError(null), []);
+  const clearError = useCallback(() => safeSetError(null), [safeSetError]);
 
   return {
     user,

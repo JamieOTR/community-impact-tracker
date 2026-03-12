@@ -1,4 +1,4 @@
-// src/services/database.ts
+// PATH: src/services/database.ts
 import { supabase } from './supabase';
 import type { Database } from './supabase';
 
@@ -11,12 +11,8 @@ export type Reward = Database['public']['Tables']['rewards']['Row'];
 export type Interaction = Database['public']['Tables']['interactions']['Row'];
 
 export class DatabaseService {
-  // =========================
-  // User operations
-  // =========================
   async getCurrentUser(): Promise<User | null> {
     try {
-      // Prefer session (stable, avoids edge cases where getUser() can be stale in some flows)
       const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) {
         console.error('[getCurrentUser] session error:', sessionError);
@@ -26,8 +22,6 @@ export class DatabaseService {
       const authUserId = sessionData.session?.user?.id;
       if (!authUserId) return null;
 
-      // CRITICAL FIX:
-      // maybeSingle() prevents PostgREST 406 when 0 rows are returned.
       const { data, error } = await supabase
         .from('users')
         .select('*')
@@ -35,14 +29,10 @@ export class DatabaseService {
         .maybeSingle();
 
       if (error) {
-        // If this fires, common causes:
-        // - auth_user_id duplicates (multiple rows match)
-        // - RLS policy error
         console.error('[getCurrentUser] query error:', error);
         return null;
       }
 
-      // If profile row doesn't exist yet, return null (caller can create profile)
       return data ?? null;
     } catch (error) {
       console.error('[getCurrentUser] unexpected error:', error);
@@ -71,9 +61,6 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Community operations
-  // =========================
   async getUserCommunity(userId: string): Promise<Community | null> {
     try {
       const { data, error } = await supabase
@@ -102,7 +89,11 @@ export class DatabaseService {
     admin_id: string;
   }): Promise<Community | null> {
     try {
-      const { data, error } = await supabase.from('communities').insert(communityData).select().single();
+      const { data, error } = await supabase
+        .from('communities')
+        .insert(communityData)
+        .select()
+        .single();
 
       if (error) {
         console.error('[createCommunity] Error creating community:', error);
@@ -116,9 +107,25 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Milestone operations
-  // =========================
+  async getPrograms(): Promise<Program[]> {
+    try {
+      const { data, error } = await supabase
+        .from('programs')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('[getPrograms] Error fetching programs:', error);
+        return [];
+      }
+
+      return data || [];
+    } catch (error) {
+      console.error('[getPrograms] unexpected error:', error);
+      return [];
+    }
+  }
+
   async getMilestones(_userId?: string): Promise<Milestone[]> {
     try {
       const { data, error } = await supabase
@@ -158,7 +165,11 @@ export class DatabaseService {
     requirements?: string[];
   }): Promise<Milestone | null> {
     try {
-      const { data, error } = await supabase.from('milestones').insert(milestoneData).select().single();
+      const { data, error } = await supabase
+        .from('milestones')
+        .insert(milestoneData)
+        .select()
+        .single();
 
       if (error) {
         console.error('[createMilestone] Error creating milestone:', error);
@@ -172,9 +183,6 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Achievement operations
-  // =========================
   async getUserAchievements(userId: string): Promise<Achievement[]> {
     try {
       const { data, error } = await supabase
@@ -206,6 +214,32 @@ export class DatabaseService {
     }
   }
 
+  async getUserAchievementsByMilestones(
+    userId: string,
+    milestoneIds: string[]
+  ): Promise<Achievement[]> {
+    try {
+      if (milestoneIds.length === 0) return [];
+
+      const { data, error } = await supabase
+        .from('achievements')
+        .select('*')
+        .eq('user_id', userId)
+        .in('milestone_id', milestoneIds)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('[getUserAchievementsByMilestones] Error fetching achievements:', error);
+        return [];
+      }
+
+      return data || [];
+    } catch (error) {
+      console.error('[getUserAchievementsByMilestones] unexpected error:', error);
+      return [];
+    }
+  }
+
   async createAchievement(achievementData: {
     user_id: string;
     milestone_id: string;
@@ -215,7 +249,11 @@ export class DatabaseService {
     status?: string;
   }): Promise<Achievement | null> {
     try {
-      const { data, error } = await supabase.from('achievements').insert(achievementData).select().single();
+      const { data, error } = await supabase
+        .from('achievements')
+        .insert(achievementData)
+        .select()
+        .single();
 
       if (error) {
         console.error('[createAchievement] Error creating achievement:', error);
@@ -229,9 +267,86 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Reward operations
-  // =========================
+  async getPendingAchievements(communityId?: string): Promise<any[]> {
+    try {
+      let query = supabase
+        .from('achievements')
+        .select(
+          `
+          achievement_id,
+          user_id,
+          milestone_id,
+          evidence_url,
+          evidence_hash,
+          status,
+          verification_status,
+          created_at,
+          updated_at,
+          users (
+            name,
+            email,
+            wallet_address,
+            community_id
+          ),
+          milestones (
+            title,
+            description,
+            reward_amount,
+            reward_token,
+            category
+          )
+        `
+        )
+        .eq('verification_status', 'pending')
+        .order('created_at', { ascending: false });
+
+      if (communityId) {
+        query = query.eq('users.community_id', communityId);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error('[getPendingAchievements] Error fetching pending achievements:', error);
+        return [];
+      }
+
+      return data || [];
+    } catch (error) {
+      console.error('[getPendingAchievements] unexpected error:', error);
+      return [];
+    }
+  }
+
+  async updateAchievementStatus(
+    achievementId: string,
+    status: 'pending' | 'verified' | 'rejected',
+    additionalData?: Partial<Achievement>
+  ): Promise<boolean> {
+    try {
+      const updateData = {
+        verification_status: status,
+        updated_at: new Date().toISOString(),
+        ...additionalData,
+      };
+
+      const { error } = await supabase
+        .from('achievements')
+        .update(updateData)
+        .eq('achievement_id', achievementId);
+
+      if (error) {
+        console.error('[updateAchievementStatus] Error updating achievement status:', error);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[updateAchievementStatus] unexpected error:', error);
+      return false;
+    }
+  }
+
   async getUserRewards(userId: string): Promise<Reward[]> {
     try {
       const { data, error } = await supabase
@@ -256,6 +371,7 @@ export class DatabaseService {
     user_id: string;
     achievement_id?: string;
     token_amount: number;
+    token_type?: string;
     description: string;
     status?: string;
   }): Promise<Reward | null> {
@@ -274,9 +390,6 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Interaction operations
-  // =========================
   async logInteraction(interactionData: {
     user_id: string;
     message: string;
@@ -295,14 +408,17 @@ export class DatabaseService {
     }
   }
 
-  // =========================
-  // Analytics operations
-  // =========================
   async getCommunityStats(communityId: string) {
     try {
       const [usersResult, programsResult, achievementsResult, rewardsResult] = await Promise.all([
-        supabase.from('users').select('user_id', { count: 'exact', head: true }).eq('community_id', communityId),
-        supabase.from('programs').select('program_id', { count: 'exact', head: true }).eq('community_id', communityId),
+        supabase
+          .from('users')
+          .select('user_id', { count: 'exact', head: true })
+          .eq('community_id', communityId),
+        supabase
+          .from('programs')
+          .select('program_id', { count: 'exact', head: true })
+          .eq('community_id', communityId),
         supabase
           .from('achievements')
           .select('achievement_id', { count: 'exact', head: true })
@@ -310,7 +426,8 @@ export class DatabaseService {
         supabase.from('rewards').select('token_amount').eq('status', 'confirmed'),
       ]);
 
-      const totalTokens = rewardsResult.data?.reduce((sum, reward) => sum + (reward.token_amount || 0), 0) || 0;
+      const totalTokens =
+        rewardsResult.data?.reduce((sum, reward) => sum + (reward.token_amount || 0), 0) || 0;
 
       return {
         totalMembers: usersResult.count || 0,

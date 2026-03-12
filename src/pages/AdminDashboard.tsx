@@ -1,3 +1,4 @@
+// PATH: src/pages/AdminDashboard.tsx
 import React, { useCallback, useEffect, useState } from 'react';
 
 import CommunityReferralManager from '../components/Admin/CommunityReferralManager';
@@ -41,13 +42,16 @@ export default function AdminDashboard() {
     setIsLoading(true);
 
     try {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('communities')
         .select('*')
         .eq('admin_id', user.user_id)
-        .single();
+        .maybeSingle();
 
-      if (data) {
+      if (error) {
+        console.error('Failed to fetch community data:', error);
+        setCommunity(null);
+      } else if (data) {
         setCommunity(data);
 
         const communityStats = await databaseService.getCommunityStats(data.community_id);

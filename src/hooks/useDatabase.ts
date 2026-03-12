@@ -1,5 +1,13 @@
 import { useState, useEffect } from 'react';
-import { databaseService, type User, type Milestone, type Achievement, type Reward, type Community } from '../services/database';
+import {
+  databaseService,
+  type User,
+  type Milestone,
+  type Achievement,
+  type Reward,
+  type Community,
+  type Program,
+} from '../services/database';
 
 export function useUserData(userId?: string) {
   const [user, setUser] = useState<User | null>(null);
@@ -20,7 +28,7 @@ export function useUserData(userId?: string) {
 
       const [userData, communityData] = await Promise.all([
         databaseService.getCurrentUser(),
-        databaseService.getUserCommunity(id)
+        databaseService.getUserCommunity(id),
       ]);
 
       setUser(userData);
@@ -34,6 +42,33 @@ export function useUserData(userId?: string) {
   };
 
   return { user, community, loading, error, refetch: () => userId && loadUserData(userId) };
+}
+
+export function usePrograms() {
+  const [programs, setPrograms] = useState<Program[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    loadPrograms();
+  }, []);
+
+  const loadPrograms = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const data = await databaseService.getPrograms();
+      setPrograms(data);
+    } catch (err) {
+      console.error('Error loading programs:', err);
+      setError('Failed to load programs');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return { programs, loading, error, refetch: loadPrograms };
 }
 
 export function useMilestones(userId?: string) {
